@@ -20,7 +20,7 @@ No Xcode required to build or run it — just the free Command Line Tools (see b
 2. **Clone this repository**:
 
    ```
-   git clone https://github.com/<your-username>/ClipboardManager.git
+   git clone https://github.com/romakail/ClipboardManager.git
    cd ClipboardManager
    ```
 
