@@ -155,6 +155,16 @@ final class HistoryPanelController: NSObject {
         // Being an accessory app (no Dock icon / not in Cmd+Tab), this stays unobtrusive.
         NSApp.activate(ignoringOtherApps: true)
 
+        // Deferred to the next run loop turn: activation is asynchronous, so ordering the panel
+        // front in the same call can race the WindowServer's registration of this app as active on
+        // the *current* Space. With .canJoinAllSpaces that left the panel appearing on every other
+        // Space but not the one actually in front.
+        DispatchQueue.main.async { [weak self] in
+            self?.presentPanel()
+        }
+    }
+
+    private func presentPanel() {
         searchOverlay.reset()
         selectedIndex = 0
         updateStats()
