@@ -13,6 +13,11 @@ final class HistoryPanelController: NSObject {
     private let imagePreview = ImagePreviewController()
 
     private var previousActiveApp: NSRunningApplication?
+    /// Set whenever the user swipes to a different Space while the panel is visible. Reactivating
+    /// `previousActiveApp` in that case would make macOS jump back to whatever Space its window
+    /// lives on — instead we skip that hand-off and just let the current Space keep whatever focus
+    /// it already has.
+    private var spaceChangedSinceShow = false
     private var selectedIndex = 0
     private var lastRenderedIDs: [UUID] = []
 
@@ -34,6 +39,19 @@ final class HistoryPanelController: NSObject {
         setupKeyHandling()
         store.onChange = { [weak self] in self?.handleStoreChange() }
         imagePreview.onClose = { [weak self] in self?.refocusOwnPanel() }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleActiveSpaceChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil
+        )
+    }
+
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    @objc private func handleActiveSpaceChange() {
+        guard panel.isVisible else { return }
+        spaceChangedSinceShow = true
     }
 
     // MARK: - Setup
@@ -148,6 +166,7 @@ final class HistoryPanelController: NSObject {
         if current?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousActiveApp = current
         }
+        spaceChangedSinceShow = false
 
         // Genuinely activate: a nonactivating panel can visually appear without this, but Quick
         // Look's own window doesn't reliably take real keyboard focus unless our app is the
@@ -165,6 +184,13 @@ final class HistoryPanelController: NSObject {
     }
 
     private func presentPanel() {
+        // A sleep/wake cycle (or a display reconfiguration) can desync the WindowServer's
+        // per-Space membership cache for a .canJoinAllSpaces panel: the panel keeps showing on
+        // every Space it was already registered on, but not on whichever one is active now.
+        // Toggling the behavior off and back on forces the WindowServer to recompute it.
+        panel.collectionBehavior = []
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+
         searchOverlay.reset()
         selectedIndex = 0
         updateStats()
@@ -205,7 +231,9 @@ final class HistoryPanelController: NSObject {
         }, completionHandler: { [weak self] in
             guard let self else { return }
             self.panel.orderOut(nil)
-            self.previousActiveApp?.activate(options: [])
+            if !self.spaceChangedSinceShow {
+                self.previousActiveApp?.activate(options: [])
+            }
             self.previousActiveApp = nil
         })
     }
