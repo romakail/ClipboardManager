@@ -18,6 +18,9 @@ final class HistoryPanelController: NSObject {
     /// lives on — instead we skip that hand-off and just let the current Space keep whatever focus
     /// it already has.
     private var spaceChangedSinceShow = false
+    /// Non-nil while show() is waiting for NSApp.activate(ignoringOtherApps:) to actually land
+    /// before presenting the panel. See presentPanelOnceActive().
+    private var activationObserver: NSObjectProtocol?
     private var selectedIndex = 0
     private var lastRenderedIDs: [UUID] = []
 
@@ -47,6 +50,7 @@ final class HistoryPanelController: NSObject {
 
     deinit {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        activationObserver.map(NotificationCenter.default.removeObserver)
     }
 
     @objc private func handleActiveSpaceChange() {
@@ -173,14 +177,40 @@ final class HistoryPanelController: NSObject {
         // truly active one — without it, keystrokes fall through to whatever app was active before.
         // Being an accessory app (no Dock icon / not in Cmd+Tab), this stays unobtrusive.
         NSApp.activate(ignoringOtherApps: true)
+        presentPanelOnceActive()
+    }
 
-        // Deferred to the next run loop turn: activation is asynchronous, so ordering the panel
-        // front in the same call can race the WindowServer's registration of this app as active on
-        // the *current* Space. With .canJoinAllSpaces that left the panel appearing on every other
-        // Space but not the one actually in front.
-        DispatchQueue.main.async { [weak self] in
-            self?.presentPanel()
+    /// Activation is asynchronous, so ordering the panel front before it actually lands can race
+    /// the WindowServer's registration of this app as active on the *current* Space — with
+    /// .canJoinAllSpaces that left the panel appearing on every other Space but not the one
+    /// actually in front. A single deferred run loop turn covers a cold activation, but right after
+    /// a sleep/wake cycle activation can take noticeably longer while the WindowServer re-establishes
+    /// display/session state, so wait for the real completion signal instead, with a timeout as a
+    /// backstop in case the notification never arrives.
+    private func presentPanelOnceActive() {
+        activationObserver.map(NotificationCenter.default.removeObserver)
+        activationObserver = nil
+
+        guard !NSApp.isActive else {
+            presentPanel()
+            return
         }
+
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.finishPendingPresent()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.finishPendingPresent()
+        }
+    }
+
+    private func finishPendingPresent() {
+        guard let observer = activationObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        activationObserver = nil
+        presentPanel()
     }
 
     private func presentPanel() {
