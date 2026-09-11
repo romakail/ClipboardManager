@@ -5,7 +5,8 @@ import AppKit
 final class SearchOverlayView: NSView {
     let field = NSTextField(string: "")
     var onTextChange: ((String) -> Void)?
-    var onReturn: (() -> Void)?
+    /// `shift` is true for ⇧Return (paste as plain text).
+    var onReturn: ((_ shift: Bool) -> Void)?
     var onEscape: (() -> Void)?
 
     private let iconLabel = NSTextField(labelWithString: "🔍")
@@ -66,8 +67,13 @@ extension SearchOverlayView: NSTextFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            onReturn?()
+        // ⇧Return may arrive as any of these depending on the field editor's key bindings, so
+        // read the modifier off the event rather than the selector.
+        if commandSelector == #selector(NSResponder.insertNewline(_:))
+            || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:))
+            || commandSelector == #selector(NSResponder.insertLineBreak(_:)) {
+            let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+            onReturn?(shift)
             return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {

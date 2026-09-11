@@ -64,8 +64,21 @@ final class ClipboardMonitor {
 
         if let string = pasteboard.string(forType: .string), !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let type: ClipboardItemType = URLDetector.isWholeStringURL(string) ? .url : .text
-            store.recordCapture(type: type, textContent: string, image: nil, sourceAppBundleID: bundleID)
+            store.recordCapture(
+                type: type, textContent: string, image: nil, sourceAppBundleID: bundleID,
+                rtfData: richData(from: pasteboard, type: .rtf),
+                htmlData: richData(from: pasteboard, type: .html)
+            )
         }
+    }
+
+    /// Rich representations are persisted inline in history.json, so very large ones (a whole
+    /// web page's HTML, say) are dropped rather than bloating the file for every copy.
+    private static let maxRichDataBytes = 256 * 1024
+
+    private func richData(from pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Data? {
+        guard let data = pasteboard.data(forType: type), !data.isEmpty, data.count <= Self.maxRichDataBytes else { return nil }
+        return data
     }
 
     private func readImage(from pasteboard: NSPasteboard) -> NSImage? {

@@ -27,7 +27,10 @@ final class HistoryStore {
 
     /// Returns true if a new/updated item was actually recorded (i.e. it wasn't a no-op duplicate-of-top).
     @discardableResult
-    func recordCapture(type: ClipboardItemType, textContent: String?, image: NSImage?, sourceAppBundleID: String?) -> Bool {
+    func recordCapture(
+        type: ClipboardItemType, textContent: String?, image: NSImage?, sourceAppBundleID: String?,
+        rtfData: Data? = nil, htmlData: Data? = nil
+    ) -> Bool {
         let hash: String
         var imageFileName: String?
 
@@ -48,18 +51,24 @@ final class HistoryStore {
             return false
         }
 
+        let makeItem = { (imageFileName: String?) -> ClipboardItem in
+            ClipboardItem(
+                id: UUID(), type: type, timestamp: Date(), textContent: textContent,
+                rtfData: rtfData, htmlData: htmlData, imageFileName: imageFileName,
+                contentHash: hash, sourceAppBundleID: sourceAppBundleID
+            )
+        }
+
         // If this content already exists elsewhere in history, remove the old entry (it will be re-inserted fresh).
         if let existingID = hashIndex[hash], let existingIndex = items.firstIndex(where: { $0.id == existingID }) {
             let old = items.remove(at: existingIndex)
             if type == .image, let imageFileName {
                 // We just saved a new copy of the same bytes; discard the duplicate file and reuse the old one.
                 ImageStore.delete(fileName: imageFileName)
-                items.insert(makeItem(type: type, textContent: textContent, imageFileName: old.imageFileName, hash: hash, sourceAppBundleID: sourceAppBundleID), at: 0)
-            } else {
-                items.insert(makeItem(type: type, textContent: textContent, imageFileName: old.imageFileName, hash: hash, sourceAppBundleID: sourceAppBundleID), at: 0)
             }
+            items.insert(makeItem(old.imageFileName), at: 0)
         } else {
-            items.insert(makeItem(type: type, textContent: textContent, imageFileName: imageFileName, hash: hash, sourceAppBundleID: sourceAppBundleID), at: 0)
+            items.insert(makeItem(imageFileName), at: 0)
         }
 
         rebuildHashIndex()
@@ -69,8 +78,15 @@ final class HistoryStore {
         return true
     }
 
-    private func makeItem(type: ClipboardItemType, textContent: String?, imageFileName: String?, hash: String, sourceAppBundleID: String?) -> ClipboardItem {
-        ClipboardItem(id: UUID(), type: type, timestamp: Date(), textContent: textContent, imageFileName: imageFileName, contentHash: hash, sourceAppBundleID: sourceAppBundleID)
+    func remove(id: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let removed = items.remove(at: index)
+        if removed.type == .image, let fileName = removed.imageFileName {
+            ImageStore.delete(fileName: fileName)
+        }
+        rebuildHashIndex()
+        scheduleSave()
+        onChange?()
     }
 
     // MARK: - Selection (reorder to top without changing timestamp)
@@ -79,6 +95,16 @@ final class HistoryStore {
         guard let index = items.firstIndex(where: { $0.id == id }), index != 0 else { return }
         let item = items.remove(at: index)
         items.insert(item, at: 0)
+        rebuildHashIndex()
+        scheduleSave()
+        onChange?()
+    }
+
+    /// User-driven manual reorder (drag and drop), as opposed to the automatic ordering from capture/paste.
+    func moveItem(id: UUID, toIndex targetIndex: Int) {
+        guard let currentIndex = items.firstIndex(where: { $0.id == id }), currentIndex != targetIndex else { return }
+        let item = items.remove(at: currentIndex)
+        items.insert(item, at: min(max(targetIndex, 0), items.count))
         rebuildHashIndex()
         scheduleSave()
         onChange?()

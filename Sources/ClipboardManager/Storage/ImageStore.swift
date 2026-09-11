@@ -38,6 +38,22 @@ enum ImageStore {
         return NSImage(contentsOf: url)
     }
 
+    /// Copies an existing image file under a fresh name, so the copy's lifecycle (e.g. saved-row
+    /// items) is independent of whatever later deletes the original (e.g. history eviction).
+    static func duplicate(fileName: String) -> String? {
+        let sourceURL = imagesDirectory.appendingPathComponent(fileName)
+        guard let data = try? Data(contentsOf: sourceURL) else { return nil }
+
+        let newFileName = "\(UUID().uuidString).png"
+        let destinationURL = imagesDirectory.appendingPathComponent(newFileName)
+        do {
+            try data.write(to: destinationURL, options: .atomic)
+            return newFileName
+        } catch {
+            return nil
+        }
+    }
+
     static func delete(fileName: String) {
         let url = imagesDirectory.appendingPathComponent(fileName)
         try? FileManager.default.removeItem(at: url)

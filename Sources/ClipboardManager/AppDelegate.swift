@@ -4,6 +4,7 @@ import ServiceManagement
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var store: HistoryStore!
+    private var savedStore: SavedStore!
     private var monitor: ClipboardMonitor!
     private var hotKeyManager: HotKeyManager!
     private var panelController: HistoryPanelController!
@@ -14,7 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         store = HistoryStore()
-        panelController = HistoryPanelController(store: store)
+        savedStore = SavedStore()
+        panelController = HistoryPanelController(store: store, savedStore: savedStore)
 
         monitor = ClipboardMonitor(store: store)
         monitor.start()

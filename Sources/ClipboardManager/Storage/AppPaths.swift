@@ -11,4 +11,8 @@ enum AppPaths {
     static var historyFile: URL {
         supportDirectory.appendingPathComponent("history.json")
     }
+
+    static var savedFile: URL {
+        supportDirectory.appendingPathComponent("saved.json")
+    }
 }

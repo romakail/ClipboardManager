@@ -13,10 +13,18 @@ struct ClipboardItem: Codable, Identifiable, Equatable {
     let type: ClipboardItemType
     var timestamp: Date
     var textContent: String?
+    /// Rich representations captured alongside `textContent`, so Enter can paste formatting back
+    /// and ⇧Enter can strip it. Optional so history saved before these existed still decodes.
+    var rtfData: Data?
+    var htmlData: Data?
     var imageFileName: String?
     var contentHash: String
     /// Bundle identifier of whatever app was frontmost at capture time, if known.
     var sourceAppBundleID: String?
+
+    var hasRichText: Bool {
+        rtfData != nil || htmlData != nil
+    }
 
     var previewText: String {
         switch type {
@@ -39,7 +47,7 @@ struct ClipboardItem: Codable, Identifiable, Equatable {
 
     var typeLabelText: String {
         switch type {
-        case .text: return "Text"
+        case .text: return hasRichText ? "Rich Text" : "Text"
         case .url: return "Link"
         case .image: return isScreenshot ? "Screenshot" : "Image"
         }
