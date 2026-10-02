@@ -8,7 +8,8 @@ final class HistoryPanelController: NSObject {
 
     private let store: HistoryStore
     private let savedStore: SavedStore
-    private let panel = HistoryPanel()
+    /// Replaced with a fresh window on every show — see rebuildPanel().
+    private var panel = HistoryPanel()
     private let contentView = KeyCatchingView()
     private let stackView = NSStackView()
     private let searchOverlay = SearchOverlayView(frame: NSRect(x: 0, y: 0, width: 100, height: 32))
@@ -269,13 +270,19 @@ final class HistoryPanelController: NSObject {
         presentPanel()
     }
 
+    /// After a sleep/wake cycle the WindowServer can be left with stale per-Space membership for
+    /// a long-lived .canJoinAllSpaces window: it shows on every Space except the active one, and
+    /// neither re-setting collectionBehavior nor waiting for activation repairs it. A brand-new
+    /// window carries no such state, so each show gets its own and just adopts the content view.
+    private func rebuildPanel() {
+        panel.contentView = nil
+        panel.close()
+        panel = HistoryPanel()
+        panel.contentView = contentView
+    }
+
     private func presentPanel() {
-        // A sleep/wake cycle (or a display reconfiguration) can desync the WindowServer's
-        // per-Space membership cache for a .canJoinAllSpaces panel: the panel keeps showing on
-        // every Space it was already registered on, but not on whichever one is active now.
-        // Toggling the behavior off and back on forces the WindowServer to recompute it.
-        panel.collectionBehavior = []
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        rebuildPanel()
 
         searchOverlay.reset()
         selectedIndex = 0
@@ -296,6 +303,14 @@ final class HistoryPanelController: NSObject {
         lastRenderedIDs = displayedItems.map { $0.id }
 
         panel.orderFrontRegardless()
+        if !panel.isOnActiveSpace {
+            // Backstop: ask for the active Space explicitly instead of relying on all-Spaces
+            // membership having been applied to the one in front.
+            NSLog("History panel not on the active Space after ordering front; moving it there")
+            panel.orderOut(nil)
+            panel.collectionBehavior = [.moveToActiveSpace, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+            panel.orderFrontRegardless()
+        }
         panel.makeKey()
         panel.makeFirstResponder(contentView)
         scrollToSelection()
