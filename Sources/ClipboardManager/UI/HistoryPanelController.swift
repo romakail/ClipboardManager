@@ -11,19 +11,23 @@ final class HistoryPanelController: NSObject {
     /// Replaced with a fresh window on every show — see rebuildPanel().
     private var panel = HistoryPanel()
     private let contentView = KeyCatchingView()
-    private let stackView = NSStackView()
-    private let searchOverlay = SearchOverlayView(frame: NSRect(x: 0, y: 0, width: 100, height: 32))
+    private let backdrop = NSVisualEffectView()
     private let topBar = NSView()
-    private let statsLabel = NSTextField(labelWithString: "")
-    private let scrollView = NSScrollView()
-    private let collectionView = NSCollectionView()
+    private let filterBar = FilterBarView()
+    private let searchOverlay = SearchOverlayView(frame: NSRect(x: 0, y: 0, width: 100, height: 28))
+    private let hintLabel = NSTextField(labelWithString: "")
+    private let scrollView = HorizontalScrollView()
+    private let collectionView = CardCollectionView()
+    private let emptyLabel = NSTextField(labelWithString: "")
     private let imagePreview = ImagePreviewController()
     private let savedRow: SavedRowController
     /// Clips savedRow.view and animates open/closed via savedRowHeightConstraint.
     private let savedRowClip = NSView()
     private var savedRowHeightConstraint: NSLayoutConstraint!
     private var savedRowVisible = false
-    private var focusedRow: FocusedRow = .history
+    private var focusedRow: FocusedRow = .history {
+        didSet { focusDidChange() }
+    }
 
     private var previousActiveApp: NSRunningApplication?
     /// Set whenever the user swipes to a different Space while the panel is visible. Reactivating
@@ -36,9 +40,9 @@ final class HistoryPanelController: NSObject {
     private var activationObserver: NSObjectProtocol?
     private var selectedIndex = 0
     private var lastRenderedIDs: [UUID] = []
+    /// True while ⌘ is held with the panel open, which reveals the ⌘1–9 quick-paste badges.
+    private var commandHeld = false
 
-    private static let panelHeight: CGFloat = 242 // base 210, +15%
-    private static let edgeMargin: CGFloat = 0 // flush with the bottom of the screen's usable area
     private static let reorderPasteboardType = NSPasteboard.PasteboardType("com.local.ClipboardManager.historyReorder")
     /// Long enough for AppKit to resolve a drag (a few pixels of movement), short enough that a
     /// genuine click still feels instant.
@@ -49,12 +53,34 @@ final class HistoryPanelController: NSObject {
     /// neighbouring cards animate aside to make room.
     private var draggedItemID: UUID?
 
+    /// Where text clips are written so Quick Look has a file to show; emptied when the panel closes.
+    private static let previewDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ClipboardManagerPreview", isDirectory: true)
+
+    // MARK: - Filtering
+
+    /// True when the row shows a subset of history (a search query or a type chip is active).
+    private var isFiltering: Bool {
+        !searchOverlay.query.isEmpty || filterBar.selected != .all
+    }
+
+    /// Memoised result of filtering `store.items`; this is read once per card while the row
+    /// draws, so it's only recomputed after the store, the query or the type filter changes.
+    private var displayedCache: [ClipboardItem]?
+
     private var displayedItems: [ClipboardItem] {
-        let query = searchOverlay.field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.items }
-        return store.items.filter {
-            ($0.textContent ?? "").localizedCaseInsensitiveContains(query)
+        if let displayedCache { return displayedCache }
+
+        let tokens = searchOverlay.query.split(whereSeparator: \.isWhitespace).map(String.init)
+        let filter = filterBar.selected
+        let result: [ClipboardItem]
+        if tokens.isEmpty, filter == .all {
+            result = store.items
+        } else {
+            result = store.items.filter { filter.matches($0) && $0.matches(searchTokens: tokens) }
         }
+        displayedCache = result
+        return result
     }
 
     init(store: HistoryStore, savedStore: SavedStore) {
@@ -64,11 +90,19 @@ final class HistoryPanelController: NSObject {
         super.init()
         setupPanel()
         setupKeyHandling()
-        store.onChange = { [weak self] in self?.handleStoreChange() }
+        store.onChange = { [weak self] in
+            self?.displayedCache = nil
+            self?.handleStoreChange()
+        }
         imagePreview.onClose = { [weak self] in self?.refocusOwnPanel() }
         savedRow.onCardActivated = { [weak self] in
             self?.focusedRow = .saved
             self?.selectCurrent()
+        }
+        savedRow.menuProvider = { [weak self] in
+            guard let self else { return nil }
+            self.focusedRow = .saved
+            return self.focusedItem.map(self.contextMenu(for:))
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(handleActiveSpaceChange),
@@ -78,6 +112,7 @@ final class HistoryPanelController: NSObject {
 
     deinit {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
         activationObserver.map(NotificationCenter.default.removeObserver)
     }
 
@@ -88,65 +123,71 @@ final class HistoryPanelController: NSObject {
 
     // MARK: - Setup
 
-    private static let mustardColor = NSColor(srgbRed: 0.91, green: 0.82, blue: 0.53, alpha: 1.0)
-
     private func setupPanel() {
-        contentView.wantsLayer = true
-        contentView.layer?.cornerRadius = 16
-        contentView.layer?.masksToBounds = true
-        contentView.layer?.backgroundColor = NSColor.white.cgColor
-        contentView.layer?.borderWidth = 1.5
-        contentView.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.4).cgColor
+        contentView.cornerRadius = PanelMetrics.cornerRadius
+        contentView.strokeColor = NSColor.labelColor.withAlphaComponent(0.16)
+        contentView.strokeWidth = 1
 
-        let layout = NSCollectionViewFlowLayout()
-        layout.scrollDirection = .horizontal
-        layout.itemSize = HistoryItemView.cardSize
-        layout.minimumInteritemSpacing = 8
-        layout.minimumLineSpacing = 8
-        layout.sectionInset = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        collectionView.collectionViewLayout = layout
+        // Frosted backdrop: follows light/dark mode and lets the desktop show through.
+        backdrop.material = .popover
+        backdrop.blendingMode = .behindWindow
+        backdrop.state = .active
+        backdrop.maskImage = Styling.roundedMask(radius: PanelMetrics.cornerRadius)
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(backdrop)
+
+        collectionView.configureAsCardRow(in: scrollView, reorderType: Self.reorderPasteboardType)
         collectionView.dataSource = self
         collectionView.delegate = self
-        collectionView.backgroundColors = [.clear]
-        collectionView.isSelectable = true
-        collectionView.register(HistoryItemView.self, forItemWithIdentifier: HistoryItemView.identifier)
-        collectionView.registerForDraggedTypes([Self.reorderPasteboardType])
-        collectionView.setDraggingSourceOperationMask(.move, forLocal: true)
-
-        scrollView.documentView = collectionView
-        scrollView.hasHorizontalScroller = true
-        scrollView.hasVerticalScroller = false
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = .white
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.menuProvider = { [weak self] indexPath in
+            guard let self else { return nil }
+            self.focusedRow = .history
+            self.setSelectedIndex(indexPath.item)
+            return self.focusedItem.map(self.contextMenu(for:))
+        }
+        // The quick-paste badges number the cards from the first visible one, so they have to
+        // follow the row as it scrolls.
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(historyRowDidScroll),
+            name: NSView.boundsDidChangeNotification, object: scrollView.contentView
+        )
 
         searchOverlay.translatesAutoresizingMaskIntoConstraints = false
-        searchOverlay.onTextChange = { [weak self] _ in
-            self?.selectedIndex = 0
-            self?.updateDisplay(animated: false)
-        }
+        searchOverlay.onTextChange = { [weak self] _ in self?.filterDidChange() }
         searchOverlay.onReturn = { [weak self] shift in self?.selectCurrent(plainText: shift) }
         searchOverlay.onEscape = { [weak self] in self?.handleSearchFieldEscape() }
+        searchOverlay.onHorizontalArrow = { [weak self] delta in self?.moveSelection(by: delta) }
+        searchOverlay.onVerticalArrow = { [weak self] delta in
+            if delta > 0 { self?.handleDownArrow() } else { self?.handleUpArrow() }
+        }
+        searchOverlay.onTab = { [weak self] backwards in self?.filterBar.cycle(by: backwards ? -1 : 1) }
+        searchOverlay.onBackspaceWhenEmpty = { [weak self] in self?.focusCardList() }
 
-        statsLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        statsLabel.textColor = .secondaryLabelColor
-        statsLabel.alignment = .right
-        statsLabel.lineBreakMode = .byTruncatingTail
-        statsLabel.setContentHuggingPriority(.required, for: .horizontal)
-        statsLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        statsLabel.translatesAutoresizingMaskIntoConstraints = false
+        filterBar.translatesAutoresizingMaskIntoConstraints = false
+        filterBar.onChange = { [weak self] _ in self?.filterDidChange() }
 
-        topBar.wantsLayer = true
-        topBar.layer?.backgroundColor = Self.mustardColor.cgColor
-        topBar.layer?.cornerRadius = 8
+        hintLabel.font = .systemFont(ofSize: 11)
+        hintLabel.textColor = .tertiaryLabelColor
+        hintLabel.alignment = .right
+        hintLabel.lineBreakMode = .byTruncatingHead
+        hintLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+
         topBar.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(filterBar)
         topBar.addSubview(searchOverlay)
-        topBar.addSubview(statsLabel)
+        topBar.addSubview(hintLabel)
 
-        // Saved row: starts collapsed (height 0, hidden) so it contributes no layout space or
-        // stack spacing until setSavedRowVisible(true) reveals it. savedRow.view keeps its own
-        // fixed height and is bottom-anchored in the clip, so as the clip grows the row appears
-        // to rise into view from the bottom rather than just abruptly appearing.
+        emptyLabel.font = .systemFont(ofSize: 13)
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.alignment = .center
+        emptyLabel.isHidden = true
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        // Saved row: starts collapsed (height 0, hidden) until setSavedRowVisible(true) reveals
+        // it. savedRow.view keeps its own fixed height and is bottom-anchored in the clip, so as
+        // the clip grows the row appears to rise into view rather than abruptly appearing.
         savedRowClip.wantsLayer = true
         savedRowClip.layer?.masksToBounds = true
         savedRowClip.translatesAutoresizingMaskIntoConstraints = false
@@ -155,43 +196,60 @@ final class HistoryPanelController: NSObject {
         savedRow.view.translatesAutoresizingMaskIntoConstraints = false
         savedRowClip.addSubview(savedRow.view)
 
+        contentView.addSubview(topBar)
+        contentView.addSubview(scrollView)
+        contentView.addSubview(emptyLabel)
+        contentView.addSubview(savedRowClip)
+
+        let centeredSearch = searchOverlay.centerXAnchor.constraint(equalTo: topBar.centerXAnchor)
+        centeredSearch.priority = .defaultHigh
+        let searchWidth = searchOverlay.widthAnchor.constraint(equalToConstant: 300)
+        searchWidth.priority = .defaultHigh
+
         savedRowHeightConstraint = savedRowClip.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
+            backdrop.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            backdrop.topAnchor.constraint(equalTo: contentView.topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+            topBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            topBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            topBar.topAnchor.constraint(equalTo: contentView.topAnchor, constant: PanelMetrics.topPadding),
+            topBar.heightAnchor.constraint(equalToConstant: PanelMetrics.topBarHeight),
+
+            filterBar.leadingAnchor.constraint(equalTo: topBar.leadingAnchor),
+            filterBar.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+
+            // Centered when there's room; on a narrow screen it yields to the filter chips.
+            centeredSearch,
+            searchWidth,
+            searchOverlay.leadingAnchor.constraint(greaterThanOrEqualTo: filterBar.trailingAnchor, constant: 12),
+            searchOverlay.trailingAnchor.constraint(lessThanOrEqualTo: topBar.trailingAnchor),
+            searchOverlay.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            searchOverlay.heightAnchor.constraint(equalToConstant: 28),
+
+            hintLabel.leadingAnchor.constraint(greaterThanOrEqualTo: searchOverlay.trailingAnchor, constant: 14),
+            hintLabel.trailingAnchor.constraint(equalTo: topBar.trailingAnchor),
+            hintLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+
+            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 2),
+            scrollView.heightAnchor.constraint(equalToConstant: PanelMetrics.rowHeight),
+
+            emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+
+            savedRowClip.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            savedRowClip.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            savedRowClip.topAnchor.constraint(equalTo: scrollView.bottomAnchor),
             savedRowHeightConstraint,
+
             savedRow.view.leadingAnchor.constraint(equalTo: savedRowClip.leadingAnchor),
             savedRow.view.trailingAnchor.constraint(equalTo: savedRowClip.trailingAnchor),
             savedRow.view.bottomAnchor.constraint(equalTo: savedRowClip.bottomAnchor),
             savedRow.view.heightAnchor.constraint(equalToConstant: SavedRowController.rowHeight),
-        ])
-
-        stackView.orientation = .vertical
-        stackView.spacing = 6
-        stackView.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 8, right: 8)
-        stackView.addArrangedSubview(topBar)
-        stackView.addArrangedSubview(scrollView)
-        stackView.addArrangedSubview(savedRowClip)
-        stackView.translatesAutoresizingMaskIntoConstraints = false
-
-        contentView.addSubview(stackView)
-        NSLayoutConstraint.activate([
-            stackView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            stackView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            stackView.topAnchor.constraint(equalTo: contentView.topAnchor),
-            stackView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-
-            topBar.leadingAnchor.constraint(equalTo: stackView.leadingAnchor),
-            topBar.trailingAnchor.constraint(equalTo: stackView.trailingAnchor),
-            topBar.heightAnchor.constraint(equalToConstant: 34),
-
-            searchOverlay.centerXAnchor.constraint(equalTo: topBar.centerXAnchor),
-            searchOverlay.topAnchor.constraint(equalTo: topBar.topAnchor, constant: 3),
-            searchOverlay.bottomAnchor.constraint(equalTo: topBar.bottomAnchor, constant: -3),
-            searchOverlay.widthAnchor.constraint(equalTo: topBar.widthAnchor, multiplier: 1.0 / 3.0, constant: -8),
-
-            // Hugs its own content and stays pinned to the right edge, rather than stretching.
-            statsLabel.leadingAnchor.constraint(greaterThanOrEqualTo: searchOverlay.trailingAnchor, constant: 14),
-            statsLabel.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -12),
-            statsLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
         ])
 
         panel.contentView = contentView
@@ -204,12 +262,18 @@ final class HistoryPanelController: NSObject {
         contentView.onUpArrow = { [weak self] in self?.handleUpArrow() }
         contentView.onEnter = { [weak self] in self?.selectCurrent() }
         contentView.onShiftEnter = { [weak self] in self?.selectCurrent(plainText: true) }
-        contentView.onSpace = { [weak self] in self?.handleSpace() }
+        contentView.onSpace = { [weak self] in self?.togglePreview() }
         contentView.onDelete = { [weak self] in self?.handleDelete() }
+        contentView.onCommandDelete = { [weak self] in self?.handleDelete() }
         contentView.onCommandReturn = { [weak self] in self?.openLinkIfCurrentIsURL() }
         contentView.onCommandS = { [weak self] in self?.saveCurrentToSaved() }
+        contentView.onCommandC = { [weak self] in self?.selectCurrent(copyOnly: true) }
         contentView.onFind = { [weak self] in self?.activateSearch() }
         contentView.onEscape = { [weak self] in self?.handleEscape() }
+        contentView.onTab = { [weak self] backwards in self?.filterBar.cycle(by: backwards ? -1 : 1) }
+        contentView.onQuickPaste = { [weak self] number in self?.quickPaste(number) }
+        contentView.onCommandKeyChanged = { [weak self] isDown in self?.setCommandHeld(isDown) }
+        contentView.onTypeToSearch = { [weak self] event in self?.beginTypeToSearch(with: event) }
     }
 
     // MARK: - Show / hide
@@ -222,7 +286,8 @@ final class HistoryPanelController: NSObject {
         }
     }
 
-    private func show() {
+    func show() {
+        guard !panel.isVisible else { return }
         let current = NSWorkspace.shared.frontmostApplication
         if current?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousActiveApp = current
@@ -285,8 +350,11 @@ final class HistoryPanelController: NSObject {
         rebuildPanel()
 
         searchOverlay.reset()
+        filterBar.select(.all, notify: false)
+        displayedCache = nil
+        commandHeld = false
         selectedIndex = 0
-        updateStats()
+        updateHint()
 
         // The saved row always starts collapsed on a fresh open — Down reveals it again each time.
         focusedRow = .history
@@ -301,6 +369,7 @@ final class HistoryPanelController: NSObject {
 
         collectionView.reloadData()
         lastRenderedIDs = displayedItems.map { $0.id }
+        updateEmptyState()
 
         panel.orderFrontRegardless()
         if !panel.isOnActiveSpace {
@@ -313,41 +382,64 @@ final class HistoryPanelController: NSObject {
         }
         panel.makeKey()
         panel.makeFirstResponder(contentView)
-        scrollToSelection()
+        collectionView.revealCard(at: 0, animated: false)
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.28
+            context.duration = 0.24
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().setFrame(target, display: true)
             panel.animator().alphaValue = 1
         }
     }
 
-    private func hide() {
+    /// Closes the panel. With `pasteIntoPreviousApp`, the app the user came from is brought back
+    /// and sent ⌘V so the chosen item lands right where they were typing — provided direct paste
+    /// is switched on and permitted; otherwise the item simply stays on the pasteboard.
+    private func hide(pasteIntoPreviousApp: Bool = false) {
         imagePreview.hide()
         guard panel.isVisible else { return }
+        pendingClickActivation?.cancel()
+        setCommandHeld(false)
+        try? FileManager.default.removeItem(at: Self.previewDirectory)
 
-        let current = panel.frame
+        let closingPanel = panel
+        let targetApp = spaceChangedSinceShow ? nil : previousActiveApp
+        previousActiveApp = nil
+        let shouldPaste = pasteIntoPreviousApp && targetApp != nil && DirectPaste.isActive
+
+        // When pasting, hand focus back right away instead of after the fade: the target app is
+        // then already frontmost by the time the keystroke is due.
+        if shouldPaste {
+            targetApp?.activate(options: [])
+        }
+
+        let current = closingPanel.frame
         let downFrame = NSRect(x: current.minX, y: current.minY - 24, width: current.width, height: current.height)
 
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.2
+            context.duration = shouldPaste ? 0.12 : 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().setFrame(downFrame, display: true)
-            panel.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self else { return }
-            self.panel.orderOut(nil)
-            if !self.spaceChangedSinceShow {
-                self.previousActiveApp?.activate(options: [])
+            closingPanel.animator().setFrame(downFrame, display: true)
+            closingPanel.animator().alphaValue = 0
+        }, completionHandler: {
+            closingPanel.orderOut(nil)
+            guard let targetApp else { return }
+            if shouldPaste {
+                DirectPaste.paste(into: targetApp)
+            } else {
+                targetApp.activate(options: [])
             }
-            self.previousActiveApp = nil
         })
     }
 
     private func refocusOwnPanel() {
         guard panel.isVisible else { return }
         panel.makeKey()
+        focusCardList()
+    }
+
+    /// Gives keyboard focus to the cards (as opposed to the search field).
+    private func focusCardList() {
         panel.makeFirstResponder(contentView)
     }
 
@@ -355,17 +447,14 @@ final class HistoryPanelController: NSObject {
         let mouseLocation = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main
         guard let screen else { return nil }
-        let visible = screen.visibleFrame
-        // stackView.spacing (6) only applies once the saved row's arranged subview is un-hidden.
-        let extra = savedRowVisible ? SavedRowController.rowHeight + stackView.spacing : 0
-        let height = Self.panelHeight + extra
-        return NSRect(x: visible.minX, y: visible.minY + Self.edgeMargin, width: visible.width, height: height)
+        let visible = screen.visibleFrame.insetBy(dx: PanelMetrics.screenMargin, dy: 0)
+        let height = PanelMetrics.baseHeight + (savedRowVisible ? SavedRowController.rowHeight : 0)
+        return NSRect(x: visible.minX, y: visible.minY + PanelMetrics.screenMargin, width: visible.width, height: height)
     }
 
     /// Grows/shrinks the panel to reveal or collapse the saved row, animating the height
     /// constraint and the panel's frame together so the row appears to rise into place from the
-    /// bottom edge (the panel is already flush with the screen bottom, so there's no room below it
-    /// — the main row shifts up slightly to make room instead).
+    /// bottom edge (the main row shifts up to make room).
     private func setSavedRowVisible(_ visible: Bool) {
         guard savedRowVisible != visible else { return }
         savedRowVisible = visible
@@ -393,6 +482,7 @@ final class HistoryPanelController: NSObject {
 
     private func handleDownArrow() {
         guard focusedRow == .history else { return }
+        imagePreview.hide()
         focusedRow = .saved
         savedRow.resetSelection()
         setSavedRowVisible(true)
@@ -400,6 +490,7 @@ final class HistoryPanelController: NSObject {
 
     private func handleUpArrow() {
         guard focusedRow == .saved else { return }
+        imagePreview.hide()
         collapseSavedRow()
     }
 
@@ -408,7 +499,7 @@ final class HistoryPanelController: NSObject {
         setSavedRowVisible(false)
     }
 
-    // MARK: - Navigation & actions
+    // MARK: - Display
 
     /// Reconciles the collection view with the current `displayedItems`.
     /// When `animated`, a single insert/move is shown with a smooth batch update and the new
@@ -416,12 +507,13 @@ final class HistoryPanelController: NSObject {
     private func updateDisplay(animated: Bool) {
         let newIDs = displayedItems.map { $0.id }
         let oldIDs = lastRenderedIDs
-        defer { lastRenderedIDs = newIDs }
+        defer {
+            lastRenderedIDs = newIDs
+            updateEmptyState()
+        }
 
         guard animated, !oldIDs.isEmpty, oldIDs != newIDs else {
-            selectedIndex = min(selectedIndex, max(displayedItems.count - 1, 0))
-            collectionView.reloadData()
-            scrollToSelection()
+            reloadRow()
             return
         }
 
@@ -439,9 +531,7 @@ final class HistoryPanelController: NSObject {
         selectedIndex = min(selectedIndex, max(newIDs.count - 1, 0))
 
         guard removedIDs.count <= 1, addedIDs.count <= 1 else {
-            selectedIndex = min(selectedIndex, max(displayedItems.count - 1, 0))
-            collectionView.reloadData()
-            scrollToSelection()
+            reloadRow()
             return
         }
 
@@ -459,11 +549,10 @@ final class HistoryPanelController: NSObject {
             }
         }, completionHandler: { [weak self] _ in
             guard let self else { return }
-            // A cell that slid into the highlighted slot was never reconfigured, so refresh it.
-            if self.selectedIndex < self.displayedItems.count {
-                self.collectionView.reloadItems(at: [IndexPath(item: self.selectedIndex, section: 0)])
-            }
-            self.scrollToSelection()
+            // Cards that slid into new slots keep their old ring/badge state, so refresh both.
+            self.refreshHighlights()
+            self.refreshQuickPasteBadges()
+            self.collectionView.revealCard(at: self.selectedIndex, animated: true)
             if let newID = addedIDs.first, let newIndex = newIDs.firstIndex(of: newID),
                let cell = self.collectionView.item(at: IndexPath(item: newIndex, section: 0)) as? HistoryItemView {
                 cell.playInsertionAnimation()
@@ -471,17 +560,60 @@ final class HistoryPanelController: NSObject {
         })
     }
 
+    private func reloadRow() {
+        selectedIndex = min(selectedIndex, max(displayedItems.count - 1, 0))
+        collectionView.reloadData()
+        collectionView.revealCard(at: selectedIndex, animated: false)
+    }
+
     private func handleStoreChange() {
         guard panel.isVisible else { return }
-        updateStats()
         updateDisplay(animated: true)
     }
 
-    private func updateStats() {
-        let items = store.items
-        let linkCount = items.filter { $0.type == .url }.count
-        let imageCount = items.filter { $0.type == .image }.count
-        statsLabel.stringValue = "\(items.count) items · \(linkCount) links · \(imageCount) images"
+    /// The search query or the type chip changed: start again from the first match.
+    private func filterDidChange() {
+        displayedCache = nil
+        imagePreview.hide()
+        if focusedRow == .saved {
+            collapseSavedRow()
+        }
+        selectedIndex = 0
+        updateDisplay(animated: false)
+    }
+
+    private func updateEmptyState() {
+        emptyLabel.isHidden = !displayedItems.isEmpty
+        emptyLabel.stringValue = isFiltering
+            ? "Nothing found"
+            : "Your clipboard history is empty — copy something and it will show up here"
+    }
+
+    private func updateHint() {
+        let primary = DirectPaste.isActive ? "↩ Paste" : "↩ Copy"
+        hintLabel.stringValue = [primary, "⇧↩ Plain Text", "⌘1–9 Quick Paste", "⌘S Save", "Space Preview", "↓ Saved"]
+            .joined(separator: "     ")
+    }
+
+    // MARK: - Selection
+
+    private func focusDidChange() {
+        savedRow.isFocused = focusedRow == .saved
+        refreshHighlights()
+        refreshQuickPasteBadges()
+    }
+
+    /// Moves the highlight by restyling just the affected cards. Rebuilding the whole row here
+    /// (as a reload would) re-decodes every visible thumbnail on each arrow press.
+    private func setSelectedIndex(_ index: Int) {
+        selectedIndex = index
+        refreshHighlights()
+    }
+
+    private func refreshHighlights() {
+        for (index, card) in collectionView.visibleCards() {
+            card.setHighlighted(focusedRow == .history && index == selectedIndex)
+        }
     }
 
     private func moveSelection(by delta: Int) {
@@ -490,17 +622,11 @@ final class HistoryPanelController: NSObject {
         case .history:
             let count = displayedItems.count
             guard count > 0 else { return }
-            selectedIndex = max(0, min(count - 1, selectedIndex + delta))
-            collectionView.reloadData()
-            scrollToSelection()
+            setSelectedIndex(max(0, min(count - 1, selectedIndex + delta)))
+            collectionView.revealCard(at: selectedIndex, animated: true)
         case .saved:
             savedRow.moveSelection(by: delta)
         }
-    }
-
-    private func scrollToSelection() {
-        guard selectedIndex < displayedItems.count else { return }
-        collectionView.scrollToItems(at: [IndexPath(item: selectedIndex, section: 0)], scrollPosition: .centeredHorizontally)
     }
 
     /// The item currently highlighted in whichever row has focus.
@@ -511,25 +637,91 @@ final class HistoryPanelController: NSObject {
         }
     }
 
-    /// `plainText` (⇧Enter) strips any captured RTF/HTML from the paste.
-    private func selectCurrent(plainText: Bool = false) {
+    // MARK: - Quick paste (⌘1–9)
+
+    private func setCommandHeld(_ held: Bool) {
+        guard commandHeld != held else { return }
+        commandHeld = held
+        refreshQuickPasteBadges()
+    }
+
+    @objc private func historyRowDidScroll() {
+        guard commandHeld else { return }
+        refreshQuickPasteBadges()
+    }
+
+    /// Index of the first card that's (mostly) on screen: ⌘1 always means "the leftmost card I can see".
+    private func quickPasteBaseIndex() -> Int {
+        let visibleMinX = scrollView.contentView.bounds.minX
+        let stride = HistoryItemView.cardSize.width + PanelMetrics.cardSpacing
+        let firstCardMidX = PanelMetrics.rowInsets.left + HistoryItemView.cardSize.width / 2
+        return max(0, Int(((visibleMinX - firstCardMidX) / stride).rounded(.up)))
+    }
+
+    private func refreshQuickPasteBadges() {
+        let showBadges = commandHeld && focusedRow == .history
+        let base = quickPasteBaseIndex()
+        for (index, card) in collectionView.visibleCards() {
+            let number = index - base + 1
+            card.setQuickPasteNumber(showBadges && (1...9).contains(number) ? number : nil)
+        }
+    }
+
+    private func quickPaste(_ number: Int) {
+        guard focusedRow == .history else { return }
+        let index = quickPasteBaseIndex() + number - 1
+        guard index < displayedItems.count else { return }
+        activate(displayedItems[index], in: .history)
+    }
+
+    // MARK: - Actions
+
+    /// `plainText` (⇧Enter) strips any captured RTF/HTML from the paste; `copyOnly` (⌘C) puts the
+    /// item on the pasteboard without pasting it anywhere.
+    private func selectCurrent(plainText: Bool = false, copyOnly: Bool = false) {
         guard let item = focusedItem else { return }
-        switch focusedRow {
+        activate(item, in: focusedRow, plainText: plainText, copyOnly: copyOnly)
+    }
+
+    private func activate(_ item: ClipboardItem, in row: FocusedRow, plainText: Bool = false, copyOnly: Bool = false) {
+        switch row {
         case .history: store.moveToTop(id: item.id)
         case .saved: savedStore.moveToTop(id: item.id)
         }
         PasteboardWriter.write(item, plainTextOnly: plainText)
-        hide()
+        hide(pasteIntoPreviousApp: !copyOnly)
     }
 
-    private func handleSpace() {
-        guard let item = focusedItem, item.type == .image, let fileName = item.imageFileName else { return }
-
+    /// Space: Quick Look for the highlighted item — images as-is, text and links via a temp file.
+    private func togglePreview() {
         if imagePreview.isVisible {
             imagePreview.hide()
-        } else {
-            let fileURL = ImageStore.imagesDirectory.appendingPathComponent(fileName)
-            imagePreview.show(fileURL: fileURL)
+            return
+        }
+        guard let item = focusedItem, let fileURL = previewFileURL(for: item) else { return }
+        imagePreview.show(fileURL: fileURL)
+    }
+
+    private func previewFileURL(for item: ClipboardItem) -> URL? {
+        switch item.type {
+        case .image:
+            return item.imageFileName.map { ImageStore.imagesDirectory.appendingPathComponent($0) }
+        case .text, .url:
+            let directory = Self.previewDirectory
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let (fileName, data): (String, Data)
+            if let rtf = item.rtfData {
+                (fileName, data) = ("Clipboard.rtf", rtf)
+            } else {
+                (fileName, data) = ("Clipboard.txt", Data((item.textContent ?? "").utf8))
+            }
+            let fileURL = directory.appendingPathComponent(fileName)
+            do {
+                try data.write(to: fileURL, options: .atomic)
+                return fileURL
+            } catch {
+                return nil
+            }
         }
     }
 
@@ -568,21 +760,35 @@ final class HistoryPanelController: NSObject {
         }
     }
 
+    // MARK: - Search
+
     private func activateSearch() {
         guard panel.makeFirstResponder(searchOverlay.field) else { return }
         searchOverlay.field.currentEditor()?.selectAll(nil)
     }
 
+    /// Typing anywhere in the panel starts a search: focus moves to the field and the keystroke
+    /// that triggered it is replayed there, so nothing typed is lost (and input methods still work).
+    private func beginTypeToSearch(with event: NSEvent) {
+        guard panel.makeFirstResponder(searchOverlay.field),
+              let editor = searchOverlay.field.currentEditor() else { return }
+        // Focusing a text field selects its contents; put the caret at the end so the new
+        // keystroke adds to any existing query instead of replacing it.
+        editor.selectedRange = NSRange(location: (editor.string as NSString).length, length: 0)
+        editor.keyDown(with: event)
+    }
+
     /// Escape pressed while the search field itself has focus: first clear the query (and hand
     /// focus back to the list so arrow keys resume browsing), then a second Escape closes the panel.
     private func handleSearchFieldEscape() {
-        if searchOverlay.field.stringValue.isEmpty {
+        if imagePreview.isVisible {
+            imagePreview.hide()
+        } else if searchOverlay.field.stringValue.isEmpty {
             hide()
         } else {
             searchOverlay.reset()
-            selectedIndex = 0
-            updateDisplay(animated: false)
-            panel.makeFirstResponder(contentView)
+            filterDidChange()
+            focusCardList()
         }
     }
 
@@ -591,10 +797,58 @@ final class HistoryPanelController: NSObject {
             imagePreview.hide()
         } else if focusedRow == .saved {
             collapseSavedRow()
+        } else if !searchOverlay.field.stringValue.isEmpty {
+            searchOverlay.reset()
+            filterDidChange()
         } else {
             hide()
         }
     }
+
+    // MARK: - Context menu
+
+    /// Right-click menu for the focused card. The card was selected just before this is built, so
+    /// every action simply operates on `focusedItem`.
+    private func contextMenu(for item: ClipboardItem) -> NSMenu {
+        let menu = NSMenu()
+        func add(_ title: String, _ action: Selector, key: String = "", modifiers: NSEvent.ModifierFlags = []) {
+            let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            menuItem.keyEquivalentModifierMask = modifiers
+            menuItem.target = self
+            menu.addItem(menuItem)
+        }
+
+        let isText = item.type != .image
+        if DirectPaste.isActive, !spaceChangedSinceShow, let appName = previousActiveApp?.localizedName {
+            add("Paste to \(appName)", #selector(menuPaste), key: "\r")
+            if isText { add("Paste as Plain Text", #selector(menuPastePlain), key: "\r", modifiers: .shift) }
+            add("Copy", #selector(menuCopy), key: "c", modifiers: .command)
+        } else {
+            add("Copy", #selector(menuPaste), key: "\r")
+            if isText { add("Copy as Plain Text", #selector(menuPastePlain), key: "\r", modifiers: .shift) }
+        }
+
+        menu.addItem(.separator())
+        if focusedRow == .history {
+            add("Save", #selector(menuSave), key: "s", modifiers: .command)
+        }
+        if item.type == .url {
+            add("Open Link", #selector(menuOpenLink), key: "\r", modifiers: .command)
+        }
+        add("Preview", #selector(menuPreview), key: " ")
+
+        menu.addItem(.separator())
+        add("Delete", #selector(menuDelete), key: "\u{8}")
+        return menu
+    }
+
+    @objc private func menuPaste() { selectCurrent() }
+    @objc private func menuPastePlain() { selectCurrent(plainText: true) }
+    @objc private func menuCopy() { selectCurrent(copyOnly: true) }
+    @objc private func menuSave() { saveCurrentToSaved() }
+    @objc private func menuOpenLink() { openLinkIfCurrentIsURL() }
+    @objc private func menuPreview() { togglePreview() }
+    @objc private func menuDelete() { handleDelete() }
 }
 
 // MARK: - NSCollectionViewDataSource / Delegate
@@ -611,8 +865,12 @@ extension HistoryPanelController: NSCollectionViewDataSource, NSCollectionViewDe
         let items = displayedItems
         if indexPath.item < items.count {
             let item = items[indexPath.item]
-            cell.configure(with: item, highlighted: indexPath.item == selectedIndex)
+            cell.configure(with: item, highlighted: focusedRow == .history && indexPath.item == selectedIndex)
             cell.view.isHidden = item.id == draggedItemID // the dragged item's slot shows as a gap
+
+            let number = indexPath.item - quickPasteBaseIndex() + 1
+            let showBadge = commandHeld && focusedRow == .history && (1...9).contains(number)
+            cell.setQuickPasteNumber(showBadge ? number : nil)
         }
         return cell
     }
@@ -625,7 +883,7 @@ extension HistoryPanelController: NSCollectionViewDataSource, NSCollectionViewDe
     func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
         guard let indexPath = indexPaths.first else { return }
         focusedRow = .history
-        selectedIndex = indexPath.item
+        setSelectedIndex(indexPath.item)
         scheduleClickActivation()
     }
 
@@ -666,9 +924,10 @@ extension HistoryPanelController: NSCollectionViewDataSource, NSCollectionViewDe
 
     // MARK: - Drag to reorder
 
-    /// Reordering is only well-defined against the unfiltered list, so it's disabled while search is active.
+    /// Reordering is only well-defined against the unfiltered list, so it's disabled while a
+    /// search or type filter is active.
     func collectionView(_ collectionView: NSCollectionView, pasteboardWriterForItemAt indexPath: IndexPath) -> NSPasteboardWriting? {
-        guard searchOverlay.field.stringValue.isEmpty else { return nil }
+        guard !isFiltering else { return nil }
         let pasteboardItem = NSPasteboardItem()
         pasteboardItem.setString(String(indexPath.item), forType: Self.reorderPasteboardType)
         return pasteboardItem
@@ -679,7 +938,7 @@ extension HistoryPanelController: NSCollectionViewDataSource, NSCollectionViewDe
         proposedIndexPath proposedDropIndexPath: AutoreleasingUnsafeMutablePointer<NSIndexPath>,
         dropOperation proposedDropOperation: UnsafeMutablePointer<NSCollectionView.DropOperation>
     ) -> NSDragOperation {
-        guard searchOverlay.field.stringValue.isEmpty, let draggedItemID,
+        guard !isFiltering, let draggedItemID,
               let currentIndex = displayedItems.firstIndex(where: { $0.id == draggedItemID }) else { return [] }
         proposedDropOperation.pointee = .before
 

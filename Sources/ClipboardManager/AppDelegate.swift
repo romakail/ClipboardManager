@@ -1,7 +1,7 @@
 import AppKit
 import ServiceManagement
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var store: HistoryStore!
     private var savedStore: SavedStore!
@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyManager: HotKeyManager!
     private var panelController: HistoryPanelController!
 
+    private let pauseItem = NSMenuItem(title: "Pause Capturing", action: #selector(togglePause), keyEquivalent: "")
+    private let directPasteItem = NSMenuItem(title: "Paste Directly into Active App", action: #selector(toggleDirectPaste), keyEquivalent: "")
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -34,22 +36,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
     }
 
+    /// Opening the app again while it's already running (Spotlight, Finder, `open`) has nothing
+    /// else to show for it, so it brings up the history panel.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        panelController.show()
+        return false
+    }
+
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Clipboard History")
-        }
+        updateStatusIcon()
 
         let menu = NSMenu()
+        menu.delegate = self
+
         let openItem = NSMenuItem(title: "Open History (⇧⌘V)", action: #selector(openHistory), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
 
         menu.addItem(.separator())
 
-        launchAtLoginItem.target = self
-        launchAtLoginItem.state = isLaunchAtLoginEnabled ? .on : .off
-        menu.addItem(launchAtLoginItem)
+        for item in [pauseItem, directPasteItem, launchAtLoginItem] {
+            item.target = self
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+
+        let clearItem = NSMenuItem(title: "Clear History…", action: #selector(clearHistory), keyEquivalent: "")
+        clearItem.target = self
+        menu.addItem(clearItem)
 
         menu.addItem(.separator())
 
@@ -60,8 +76,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    /// Checkmarks are refreshed each time the menu opens: Accessibility access in particular can
+    /// be granted or revoked in System Settings while the app is running.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        pauseItem.state = monitor.isPaused ? .on : .off
+        directPasteItem.state = DirectPaste.isActive ? .on : .off
+        launchAtLoginItem.state = isLaunchAtLoginEnabled ? .on : .off
+    }
+
+    private func updateStatusIcon() {
+        let symbolName = monitor.isPaused ? "pause.circle" : "doc.on.clipboard"
+        let description = monitor.isPaused ? "Clipboard History (paused)" : "Clipboard History"
+        statusItem.button?.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)
+    }
+
     @objc private func openHistory() {
         panelController.toggle()
+    }
+
+    @objc private func togglePause() {
+        monitor.isPaused.toggle()
+        updateStatusIcon()
+    }
+
+    /// Direct paste needs Accessibility access. Until that's granted, choosing this asks for it
+    /// (macOS shows its own prompt leading to System Settings) rather than flipping the setting.
+    @objc private func toggleDirectPaste() {
+        if DirectPaste.isTrusted {
+            Preferences.directPaste.toggle()
+        } else {
+            Preferences.directPaste = true
+            DirectPaste.requestAccess()
+        }
+    }
+
+    @objc private func clearHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Clear your clipboard history?"
+        alert.informativeText = "All \(store.items.count) history items will be deleted. Saved items are kept. This can't be undone."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Clear History")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            store.removeAll()
+        }
     }
 
     @objc private func quit() {
@@ -82,6 +143,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             NSLog("Failed to toggle launch at login: \(error)")
         }
-        launchAtLoginItem.state = isLaunchAtLoginEnabled ? .on : .off
     }
 }

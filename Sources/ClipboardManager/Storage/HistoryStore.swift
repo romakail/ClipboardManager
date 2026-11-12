@@ -89,6 +89,21 @@ final class HistoryStore {
         onChange?()
     }
 
+    /// Erases the whole capture history. Saved items live in SavedStore (with their own image
+    /// copies) and are untouched.
+    func removeAll() {
+        guard !items.isEmpty else { return }
+        for item in items where item.type == .image {
+            if let fileName = item.imageFileName {
+                ImageStore.delete(fileName: fileName)
+            }
+        }
+        items.removeAll()
+        rebuildHashIndex()
+        scheduleSave()
+        onChange?()
+    }
+
     // MARK: - Selection (reorder to top without changing timestamp)
 
     func moveToTop(id: UUID) {

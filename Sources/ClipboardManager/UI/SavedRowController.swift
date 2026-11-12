@@ -1,26 +1,34 @@
 import AppKit
 
-/// The second, "saved" row: a thin header plus a horizontal strip of previously-saved items,
+/// The second, "saved" row: a thin caption plus a horizontal strip of previously-saved items,
 /// reusing the same card view as the main history row. Composed into HistoryPanelController the
 /// same way ImagePreviewController is — a self-contained sub-controller with its own selection.
 final class SavedRowController: NSObject {
-    static let rowHeight: CGFloat = 22 + HistoryItemView.cardSize.height + 16 // header + card + section insets
+    private static let headerHeight: CGFloat = 22
+    static let rowHeight: CGFloat = headerHeight + PanelMetrics.rowHeight
 
     let view = NSView()
     private let store: SavedStore
-    private let headerView = NSView()
-    private let headerLabel = NSTextField(labelWithString: "Saved")
-    private let emptyLabel = NSTextField(labelWithString: "No saved items yet — ⌘S on a history item")
-    private let scrollView = NSScrollView()
-    private let collectionView = NSCollectionView()
+    private let separator = StyledView()
+    private let headerIcon = NSImageView()
+    private let headerLabel = NSTextField(labelWithString: "SAVED")
+    private let emptyLabel = NSTextField(labelWithString: "Nothing saved yet — press ⌘S on a history item to keep it here")
+    private let scrollView = HorizontalScrollView()
+    private let collectionView = CardCollectionView()
 
     private(set) var selectedIndex = 0
     var items: [ClipboardItem] { store.items }
 
+    /// Whether this row currently owns the keyboard; only the focused row shows a selection ring.
+    var isFocused = false {
+        didSet { refreshHighlights() }
+    }
+
     /// Fired when the user clicks a card directly (mouse path) — the owner decides what "activate" means.
     var onCardActivated: (() -> Void)?
+    /// Fired when a card is right-clicked (after it has become the selection); returns its menu.
+    var menuProvider: (() -> NSMenu?)?
 
-    private static let headerColor = NSColor(srgbRed: 0.62, green: 0.80, blue: 0.86, alpha: 1.0)
     private static let reorderPasteboardType = NSPasteboard.PasteboardType("com.local.ClipboardManager.savedReorder")
     /// See HistoryPanelController's identical setup: didSelectItemsAt fires on mouse-down, before
     /// AppKit knows whether the gesture is a click or the start of a drag, so activation is
@@ -38,38 +46,29 @@ final class SavedRowController: NSObject {
     }
 
     private func setupViews() {
-        headerView.wantsLayer = true
-        headerView.layer?.backgroundColor = Self.headerColor.cgColor
-        headerView.layer?.cornerRadius = 8
-        headerView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(headerView)
+        separator.fillColor = .separatorColor
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(separator)
 
-        headerLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        headerLabel.textColor = .black
+        headerIcon.image = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: nil)
+        headerIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        headerIcon.contentTintColor = .secondaryLabelColor
+        headerIcon.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(headerIcon)
+
+        headerLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        headerLabel.textColor = .secondaryLabelColor
         headerLabel.translatesAutoresizingMaskIntoConstraints = false
-        headerView.addSubview(headerLabel)
+        view.addSubview(headerLabel)
 
-        let layout = NSCollectionViewFlowLayout()
-        layout.scrollDirection = .horizontal
-        layout.itemSize = HistoryItemView.cardSize
-        layout.minimumInteritemSpacing = 8
-        layout.minimumLineSpacing = 8
-        layout.sectionInset = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        collectionView.collectionViewLayout = layout
+        collectionView.configureAsCardRow(in: scrollView, reorderType: Self.reorderPasteboardType)
         collectionView.dataSource = self
         collectionView.delegate = self
-        collectionView.backgroundColors = [.clear]
-        collectionView.isSelectable = true
-        collectionView.register(HistoryItemView.self, forItemWithIdentifier: HistoryItemView.identifier)
-        collectionView.registerForDraggedTypes([Self.reorderPasteboardType])
-        collectionView.setDraggingSourceOperationMask(.move, forLocal: true)
-
-        scrollView.documentView = collectionView
-        scrollView.hasHorizontalScroller = true
-        scrollView.hasVerticalScroller = false
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = .white
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.menuProvider = { [weak self] indexPath in
+            guard let self else { return nil }
+            self.select(index: indexPath.item)
+            return self.menuProvider?()
+        }
         view.addSubview(scrollView)
 
         emptyLabel.font = .systemFont(ofSize: 12)
@@ -79,17 +78,20 @@ final class SavedRowController: NSObject {
         view.addSubview(emptyLabel)
 
         NSLayoutConstraint.activate([
-            headerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            headerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
-            headerView.topAnchor.constraint(equalTo: view.topAnchor),
-            headerView.heightAnchor.constraint(equalToConstant: 22),
+            separator.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            separator.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            separator.topAnchor.constraint(equalTo: view.topAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1),
 
-            headerLabel.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 10),
-            headerLabel.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+            headerIcon.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
+            headerIcon.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
+
+            headerLabel.leadingAnchor.constraint(equalTo: headerIcon.trailingAnchor, constant: 5),
+            headerLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
 
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 6),
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor, constant: Self.headerHeight),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
@@ -110,7 +112,20 @@ final class SavedRowController: NSObject {
     }
 
     func resetSelection() {
-        selectedIndex = 0
+        select(index: 0)
+    }
+
+    /// Moves the selection without rebuilding the row — only the ring on the affected cards changes.
+    private func select(index: Int) {
+        selectedIndex = index
+        clampSelection()
+        refreshHighlights()
+    }
+
+    private func refreshHighlights() {
+        for (index, card) in collectionView.visibleCards() {
+            card.setHighlighted(isFocused && index == selectedIndex)
+        }
     }
 
     @discardableResult
@@ -119,15 +134,13 @@ final class SavedRowController: NSObject {
         guard count > 0 else { return false }
         let newIndex = max(0, min(count - 1, selectedIndex + delta))
         guard newIndex != selectedIndex else { return false }
-        selectedIndex = newIndex
-        collectionView.reloadData()
-        scrollToSelection()
+        select(index: newIndex)
+        scrollToSelection(animated: true)
         return true
     }
 
-    func scrollToSelection() {
-        guard selectedIndex < items.count else { return }
-        collectionView.scrollToItems(at: [IndexPath(item: selectedIndex, section: 0)], scrollPosition: .centeredHorizontally)
+    func scrollToSelection(animated: Bool = false) {
+        collectionView.revealCard(at: selectedIndex, animated: animated)
     }
 
     func selectedItem() -> ClipboardItem? {
@@ -162,7 +175,7 @@ extension SavedRowController: NSCollectionViewDataSource, NSCollectionViewDelega
         }
         if indexPath.item < items.count {
             let item = items[indexPath.item]
-            cell.configure(with: item, highlighted: indexPath.item == selectedIndex)
+            cell.configure(with: item, highlighted: isFocused && indexPath.item == selectedIndex)
             cell.view.isHidden = item.id == draggedItemID // the dragged item's slot shows as a gap
         }
         return cell
@@ -170,7 +183,7 @@ extension SavedRowController: NSCollectionViewDataSource, NSCollectionViewDelega
 
     func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
         guard let indexPath = indexPaths.first else { return }
-        selectedIndex = indexPath.item
+        select(index: indexPath.item)
         pendingClickActivation?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.onCardActivated?() }
         pendingClickActivation = work
@@ -227,7 +240,9 @@ extension SavedRowController: NSCollectionViewDataSource, NSCollectionViewDelega
             selectedIndex = destination
             collectionView.animator().performBatchUpdates({
                 collectionView.moveItem(at: IndexPath(item: currentIndex, section: 0), to: IndexPath(item: destination, section: 0))
-            }, completionHandler: nil)
+            }, completionHandler: { [weak self] _ in
+                self?.refreshHighlights()
+            })
         }
         return .move
     }
